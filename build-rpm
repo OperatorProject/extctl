@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Build the extctl RPM from the app/ crate and drop it in dist/.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' app/Cargo.toml | head -1)"
+APP_DIR="$(pwd)/app"
+SPEC="$(pwd)/extctl.spec"
+DIST="$(pwd)/dist"
+
+# Reusable rpmbuild workspace so --locked sees the existing Cargo.lock.
+RPMBUILD="$APP_DIR/rpmbuild"
+mkdir -p "$RPMBUILD"/{SOURCES,BUILD,BUILDROOT,RPMS,SRPMS}
+
+# Source tarball of the crate (excludes target/, .git, rpmbuild/). Package
+# under a top-level extctl-<version>/ dir so %autosetup extracts cleanly.
+tar -C "$APP_DIR" \
+    --transform "s,^,extctl-$VERSION/," \
+    --exclude='target' --exclude='rpmbuild' --exclude='.git' \
+    -czf "$RPMBUILD/SOURCES/extctl-$VERSION.tar.gz" .
+
+mkdir -p "$DIST"
+rpmbuild \
+    --define "_topdir $RPMBUILD" \
+    --define "_sourcedir $RPMBUILD/SOURCES" \
+    --define "_rpmdir $RPMBUILD/RPMS" \
+    -bb "$SPEC" >/dev/null
+
+RPM="$(find "$RPMBUILD/RPMS" -name 'extctl-*.rpm' -print -quit)"
+install -Dm0644 "$RPM" "$DIST/$(basename "$RPM")"
+echo "Built $(basename "$RPM") into $DIST/"
