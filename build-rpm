@@ -27,6 +27,8 @@ rpmbuild \
     --define "_rpmdir $RPMBUILD/RPMS" \
     -bb "$SPEC" >/dev/null
 
-RPM="$(find "$RPMBUILD/RPMS" -name 'extctl-*.rpm' -print -quit)"
+# The main binary RPM is extctl-<ver>-<rel>.<arch>.rpm; skip the
+# extctl-debugsource / extctl-debuginfo subpackages.
+RPM="$(find "$RPMBUILD/RPMS" -name 'extctl-*.rpm' ! -name 'extctl-debug*' -print -quit)"
 install -Dm0644 "$RPM" "$DIST/$(basename "$RPM")"
 echo "Built $(basename "$RPM") into $DIST/"
