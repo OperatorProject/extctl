@@ -644,7 +644,13 @@ fn read_manifest(image: &Path) -> Result<Manifest, String> {
             sysext_level = Some(v.to_string());
         }
     }
-    let name = name.ok_or_else(|| "extension-release is missing EXTENSION=".to_string())?;
+    let name = match name {
+        Some(n) => n,
+        // systemd derives the extension name from the filename
+        // (extension-release.<name>) when EXTENSION= is absent, which is
+        // how mkosi builds sysexts. Match that behavior.
+        None => image_name(image)?,
+    };
     Ok(Manifest {
         name,
         id,
