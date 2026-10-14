@@ -18,15 +18,18 @@ $ sudo extctl keygen            # one-time setup; like `docker login`
 $ extctl init mytool            # scaffold ./mytool/ + manifest
 $ $EDITOR mytool/usr/bin/*      # drop your tool in
 $ extctl build mytool           # package -> mytool.raw
-$ extctl sign mytool.raw        # sign (uses the keygen'd key)
+$ sudo extctl sign mytool.raw   # sign (uses the keygen'd root-only key)
 $ sudo extctl install mytool.raw  # verify + copy + merge
 $ extctl ls                     # see it installed + merged
 $ sudo extctl remove mytool     # tear it back down
 ```
 
-Only `keygen`, `install`, and `remove` need root (they write under `/etc`
-and the extension directories, and merging overlays `/usr`). Everything
-else runs as a normal user.
+`keygen`, `install`, `remove`, `refresh`, and `unmerge` need root, as does
+`sign` when it uses the default key (which is stored mode `0600` under
+`/etc`). Pass `sign --key <readable-key>` to sign unprivileged. `init`,
+`build`, `ls`, and `status` run as a normal user; `verify` and
+`install --dry-run` write nothing but mounting the image to read its
+manifest may still require root.
 
 ## Installation
 
@@ -75,7 +78,7 @@ Manifest populated from host os-release. Package it with:
 
 $ $EDITOR mytool/usr/bin/mytool      # put your tool inside
 $ extctl build mytool                # -> mytool.raw
-$ extctl sign mytool.raw             # -> mytool.raw.{verity,roothash,p7s}
+$ sudo extctl sign mytool.raw        # -> mytool.raw.{verity,roothash,p7s}
 ```
 
 Each step prints the next command, so the tool walks you through it.

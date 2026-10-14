@@ -8,6 +8,7 @@ use std::fs;
 #[derive(Debug, Default, Clone)]
 pub struct OsRelease {
     pub id: Option<String>,
+    pub id_like: Option<String>,
     pub version_id: Option<String>,
     pub sysext_level: Option<String>,
 }
@@ -33,6 +34,7 @@ impl OsRelease {
         }
         Self {
             id: fields.get("ID").cloned(),
+            id_like: fields.get("ID_LIKE").cloned(),
             version_id: fields.get("VERSION_ID").cloned(),
             sysext_level: fields.get("SYSEXT_LEVEL").cloned(),
         }
@@ -56,5 +58,11 @@ mod tests {
         let r = OsRelease::parse("NAME=foo\n");
         assert_eq!(r.id, None);
         assert_eq!(r.version_id, None);
+    }
+
+    #[test]
+    fn parses_id_like() {
+        let r = OsRelease::parse("ID=fedora\nID_LIKE=\"rhel centos\"\n");
+        assert_eq!(r.id_like.as_deref(), Some("rhel centos"));
     }
 }

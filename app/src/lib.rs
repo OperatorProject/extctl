@@ -16,6 +16,7 @@ pub struct Manifest {
     pub id: Option<String>,
     pub version_id: Option<String>,
     pub sysext_level: Option<String>,
+    pub architecture: Option<String>,
 }
 
 /// Search directories for extensions, in systemd's priority order.
@@ -158,6 +159,42 @@ pub fn keygen() -> Result<(), String> {
 
 pub fn sign(image: &Path, cert: Option<&Path>, key: Option<&Path>) -> Result<(), String> {
     let name = image_name(image)?;
+    let verity = sidecar(image, "verity");
+    let roothash = sidecar(image, "roothash");
+    let sig = sidecar(image, "roothash.p7s");
+
+    match sign_impl(image, cert, key, &verity, &roothash, &sig) {
+        Ok(()) => {
+            println!("Signed {name}:");
+            println!(
+                "  {} ({})",
+                verity.display(),
+                fs::metadata(&verity).map(|m| m.len()).unwrap_or(0)
+            );
+            println!("  {} (64 bytes)", roothash.display());
+            println!("  {}", sig.display());
+            println!("Install with: extctl install {}", image.display());
+            Ok(())
+        }
+        Err(e) => {
+            // Don't leave truncated/partial sidecars behind: a 0-byte
+            // .roothash.p7s would make later verify/install fail confusingly.
+            for p in [&verity, &roothash, &sig] {
+                let _ = fs::remove_file(p);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn sign_impl(
+    image: &Path,
+    cert: Option<&Path>,
+    key: Option<&Path>,
+    verity: &Path,
+    roothash: &Path,
+    sig: &Path,
+) -> Result<(), String> {
     let cert = match cert {
         Some(c) => c.to_path_buf(),
         None => default_cert()?,
@@ -166,9 +203,6 @@ pub fn sign(image: &Path, cert: Option<&Path>, key: Option<&Path>) -> Result<(),
         Some(k) => k.to_path_buf(),
         None => default_key()?,
     };
-    let verity = sidecar(image, "verity");
-    let roothash = sidecar(image, "roothash");
-    let sig = sidecar(image, "roothash.p7s");
 
     // 1. Compute verity.
     let out = run_capture(
@@ -190,13 +224,13 @@ pub fn sign(image: &Path, cert: Option<&Path>, key: Option<&Path>) -> Result<(),
 
     // 2. Write the hex with NO trailing newline, byte-exact.
     let mut f =
-        fs::File::create(&roothash).map_err(|e| format!("creating {}: {e}", roothash.display()))?;
+        fs::File::create(roothash).map_err(|e| format!("creating {}: {e}", roothash.display()))?;
     f.write_all(root_hash.as_bytes())
         .map_err(|e| format!("writing {}: {e}", roothash.display()))?;
     f.sync_all()
         .map_err(|e| format!("syncing {}: {e}", roothash.display()))?;
     drop(f);
-    let size = fs::metadata(&roothash).map_err(|e| e.to_string())?.len();
+    let size = fs::metadata(roothash).map_err(|e| e.to_string())?.len();
     if size != 64 {
         return Err(format!(
             "roothash file is {size} bytes, want 64 (trailing newline?); aborting"
@@ -224,16 +258,6 @@ pub fn sign(image: &Path, cert: Option<&Path>, key: Option<&Path>) -> Result<(),
         ],
         None,
     )?;
-
-    println!("Signed {name}:");
-    println!(
-        "  {} ({})",
-        verity.display(),
-        fs::metadata(&verity).map(|m| m.len()).unwrap_or(0)
-    );
-    println!("  {} (64 bytes)", roothash.display());
-    println!("  {}", sig.display());
-    println!("Install with: extctl install {}", image.display());
     Ok(())
 }
 
@@ -242,10 +266,7 @@ pub fn verify(image: &Path) -> Result<(), String> {
     let host = osrelease::OsRelease::read("/usr/lib/os-release")?;
     check_metadata(&manifest, &host)?;
     check_signature(image)?;
-    println!(
-        "OK: {} is a valid, signed extension for this host",
-        manifest.name
-    );
+    println!("OK: {} is a valid extension for this host", manifest.name);
     Ok(())
 }
 
@@ -317,9 +338,21 @@ pub fn install(image: &Path, boot: bool, dry_run: bool) -> Result<(), String> {
     match refresh() {
         Ok(()) => {}
         Err(e) => {
-            // Roll back.
-            let _ = fs::remove_file(&dest);
-            return Err(format!("refresh failed; rolled back install: {e}"));
+            // Roll back: remove the image and every sidecar we copied.
+            remove_installed(Path::new(target_dir), &manifest.name);
+            // A single un-installable sibling image makes systemd-sysext
+            // refresh fail for *everyone*, so point at the culprits instead
+            // of leaving the user staring at a one-line refresh error.
+            let blockers = blocking_candidates();
+            if blockers.is_empty() {
+                return Err(format!("refresh failed; rolled back install: {e}"));
+            }
+            let mut msg = format!("refresh failed; rolled back install: {e}");
+            msg.push_str("\nblocked by other candidate image(s):");
+            for (file, reason) in blockers {
+                msg.push_str(&format!("\n  - {file}: {reason}"));
+            }
+            return Err(msg);
         }
     }
 
@@ -328,7 +361,7 @@ pub fn install(image: &Path, boot: bool, dry_run: bool) -> Result<(), String> {
         Ok(())
     } else {
         // Not merged; roll back.
-        let _ = fs::remove_file(&dest);
+        remove_installed(Path::new(target_dir), &manifest.name);
         Err(format!(
             "{} installed but did not merge; rolled back. Run 'extctl status' for why.",
             manifest.name
@@ -336,51 +369,38 @@ pub fn install(image: &Path, boot: bool, dry_run: bool) -> Result<(), String> {
     }
 }
 
+/// Delete an installed extension image and all of its sidecars, ignoring
+/// errors (used for rollback).
+fn remove_installed(target_dir: &Path, name: &str) {
+    let _ = fs::remove_file(target_dir.join(format!("{name}.raw")));
+    for ext in ["verity", "roothash", "roothash.p7s"] {
+        let _ = fs::remove_file(target_dir.join(format!("{name}.{ext}")));
+    }
+}
+
 pub fn status() -> Result<(), String> {
     let merged = merged_names()?;
-    for dir in SEARCH_DIRS {
-        if !Path::new(dir).is_dir() {
-            continue;
+    let cands = candidates();
+    for c in &cands {
+        let mut reasons = Vec::new();
+        if let Some(r) = candidate_reason(c) {
+            reasons.push(r);
         }
-        let mut entries: Vec<_> = fs::read_dir(dir)
-            .map_err(|e| format!("reading {dir}: {e}"))?
-            .flatten()
-            .filter(|e| e.path().extension().map(|x| x == "raw").unwrap_or(false))
-            .collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let path = entry.path();
-            let fname = entry.file_name().to_string_lossy().to_string();
-            let stem = fname.trim_end_matches(".raw").to_string();
-            let is_merged = merged.contains(&stem);
-            let mut reasons = Vec::new();
+        if !merged.contains(&c.stem) && reasons.is_empty() {
+            reasons.push("not merged (see systemd-sysext status)".to_string());
+        }
 
-            if let Ok(manifest) = read_manifest(&path) {
-                if manifest.name != stem {
-                    reasons.push(format!("filename '{stem}' != NAME '{}'", manifest.name));
-                } else {
-                    let host =
-                        osrelease::OsRelease::read("/usr/lib/os-release").unwrap_or_default();
-                    if let Some(r) = metadata_problem(&manifest, &host) {
-                        reasons.push(r);
-                    }
-                }
-            } else {
-                reasons.push("could not read extension-release".to_string());
-            }
-            if !is_merged && reasons.is_empty() {
-                reasons.push("not merged (see systemd-sysext status)".to_string());
-            }
-
-            if reasons.is_empty() {
-                println!("{}  merged", fname);
-            } else {
-                println!("{}  NOT merged:", fname);
-                for r in reasons {
-                    println!("    - {r}");
-                }
+        if reasons.is_empty() {
+            println!("{}  merged", c.file);
+        } else {
+            println!("{}  NOT merged:", c.file);
+            for r in reasons {
+                println!("    - {r}");
             }
         }
+    }
+    if cands.is_empty() {
+        println!("(no extensions installed)");
     }
     Ok(())
 }
@@ -390,6 +410,29 @@ struct Candidate {
     dir: PathBuf,
     file: String,
     stem: String,
+}
+
+/// Why a candidate cannot be merged, if we can tell: a metadata mismatch or
+/// an unreadable release. Returns None if nothing is obviously wrong.
+fn candidate_reason(c: &Candidate) -> Option<String> {
+    let path = c.dir.join(&c.file);
+    match read_manifest(&path) {
+        Ok(manifest) => {
+            let host = osrelease::OsRelease::read("/usr/lib/os-release").unwrap_or_default();
+            metadata_problem(&manifest, &host)
+        }
+        Err(_) => Some("could not read extension-release".to_string()),
+    }
+}
+
+/// Candidates that would make `systemd-sysext refresh` fail for everyone:
+/// images systemd cannot even read metadata from, or whose release does not
+/// match the host. Used to explain a refresh failure.
+fn blocking_candidates() -> Vec<(String, String)> {
+    candidates()
+        .iter()
+        .filter_map(|c| candidate_reason(c).map(|r| (c.file.clone(), r)))
+        .collect()
 }
 
 fn candidates() -> Vec<Candidate> {
@@ -427,25 +470,9 @@ pub fn ls() -> Result<(), String> {
         let state = if merged.contains(&c.stem) {
             "merged".to_string()
         } else {
-            let mut why = String::new();
-            let path = c.dir.join(&c.file);
-            if let Ok(manifest) = read_manifest(&path) {
-                if manifest.name != c.stem {
-                    why = format!("filename != NAME '{}'", manifest.name);
-                } else {
-                    let host =
-                        osrelease::OsRelease::read("/usr/lib/os-release").unwrap_or_default();
-                    if let Some(r) = metadata_problem(&manifest, &host) {
-                        why = r;
-                    }
-                }
-            } else {
-                why = "unreadable manifest".to_string();
-            }
-            if why.is_empty() {
-                "not merged".to_string()
-            } else {
-                format!("not merged ({why})")
+            match candidate_reason(&c) {
+                Some(why) => format!("not merged ({why})"),
+                None => "not merged".to_string(),
             }
         };
         println!("{:<24} {:<22} {}", c.stem, c.dir.display(), state);
@@ -629,39 +656,38 @@ fn read_manifest(image: &Path) -> Result<Manifest, String> {
             image.display()
         ));
     }
-    let mut name = None;
     let mut id = None;
     let mut version_id = None;
     let mut sysext_level = None;
+    let mut architecture = None;
     for line in info.sysext_release {
-        if let Some(v) = line.strip_prefix("EXTENSION=") {
-            name = Some(v.to_string());
-        } else if let Some(v) = line.strip_prefix("ID=") {
+        if let Some(v) = line.strip_prefix("ID=") {
             id = Some(v.to_string());
         } else if let Some(v) = line.strip_prefix("VERSION_ID=") {
             version_id = Some(v.to_string());
         } else if let Some(v) = line.strip_prefix("SYSEXT_LEVEL=") {
             sysext_level = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("ARCHITECTURE=") {
+            architecture = Some(v.to_string());
         }
     }
-    let name = match name {
-        Some(n) => n,
-        // systemd derives the extension name from the filename
-        // (extension-release.<name>) when EXTENSION= is absent, which is
-        // how mkosi builds sysexts. Match that behavior.
-        None => image_name(image)?,
-    };
+    // systemd derives the extension name from the image filename (the
+    // release file must be `extension-release.<filename-stem>`); the
+    // EXTENSION= field is ignored. Match that behavior so install never
+    // renames the image away from the name systemd expects.
+    let name = image_name(image)?;
     Ok(Manifest {
         name,
         id,
         version_id,
         sysext_level,
+        architecture,
     })
 }
 
 #[derive(Deserialize)]
 struct DissectInfo {
-    #[serde(rename = "sysextRelease")]
+    #[serde(rename = "sysextRelease", default)]
     sysext_release: Vec<String>,
     #[serde(rename = "useSystemExtension")]
     use_system_extension: bool,
@@ -674,31 +700,150 @@ fn check_metadata(m: &Manifest, host: &osrelease::OsRelease) -> Result<(), Strin
     Ok(())
 }
 
+/// The host CPU architecture, named the way systemd does (e.g. "x86-64",
+/// "arm64"). Returns None for architectures we don't recognize, in which
+/// case ARCHITECTURE= validation is skipped rather than falsely rejected.
+fn host_architecture() -> Option<String> {
+    #[cfg(unix)]
+    {
+        // SAFETY: uname() has no preconditions and writes into the provided
+        // buffer; we zero it first and check the return value.
+        let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut u) } != 0 {
+            return None;
+        }
+        // SAFETY: uname() guarantees machine is a NUL-terminated C string.
+        let machine = unsafe { std::ffi::CStr::from_ptr(u.machine.as_ptr()) };
+        machine_to_systemd_arch(&machine.to_string_lossy()).map(str::to_string)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Map a `uname -m` machine string to systemd's `architecture_to_string()`
+/// value (see systemd's src/basic/architecture.c).
+fn machine_to_systemd_arch(machine: &str) -> Option<&'static str> {
+    Some(match machine {
+        "aarch64" => "arm64",
+        "aarch64_be" => "arm64-be",
+        "armv8l" | "armv7ml" | "armv7l" | "armv6l" | "armv5tl" | "armv5tel" | "armv5tejl"
+        | "armv4tl" | "armv4l" => "arm",
+        "armv8b" | "armv7mb" | "armv7b" | "armv6b" | "armv5tejb" | "armv5teb" | "armv5tb"
+        | "armv4tb" | "armv4b" => "arm-be",
+        "x86_64" => "x86-64",
+        "i686" | "i586" | "i486" | "i386" => "x86",
+        "alpha" => "alpha",
+        "arc" => "arc",
+        "arceb" => "arc-be",
+        "crisv32" => "cris",
+        "ia64" => "ia64",
+        "loongarch64" => "loongarch64",
+        "m68k" => "m68k",
+        "mips64" => "mips64",
+        "mips" => "mips",
+        "nios2" => "nios2",
+        "parisc64" => "parisc64",
+        "parisc" => "parisc",
+        "ppc64le" => "ppc64-le",
+        "ppc64" => "ppc64",
+        "ppcle" => "ppc-le",
+        "ppc" => "ppc",
+        "riscv64" => "riscv64",
+        "riscv32" => "riscv32",
+        "s390x" => "s390x",
+        "s390" => "s390",
+        "sh5" => "sh64",
+        "sh4a" | "sh4" | "sh3" | "sh2a" | "sh2" => "sh",
+        "sparc64" => "sparc64",
+        "sparc" => "sparc",
+        "tilegx" => "tilegx",
+        _ => return None,
+    })
+}
+
 fn metadata_problem(m: &Manifest, host: &osrelease::OsRelease) -> Option<String> {
-    let id_ok = host
-        .id
-        .as_ref()
-        .map(|h| m.id.as_deref() == Some(h) || m.id.as_deref() == Some("_any"))
-        .unwrap_or(true);
-    if !id_ok {
+    // Mirror systemd's extension_release_validate(): architecture and ID
+    // must match, and version matching differs depending on whether
+    // SYSEXT_LEVEL is in play.
+    if let Some(ext_arch) = m.architecture.as_deref()
+        && !ext_arch.is_empty()
+        && ext_arch != "_any"
+        && let Some(host_arch) = host_architecture()
+        && ext_arch != host_arch.as_str()
+    {
         return Some(format!(
-            "ID='{}' does not match host '{}'",
-            m.id.as_deref().unwrap_or("(unset)"),
-            host.id.as_deref().unwrap_or("(unset)")
+            "ARCHITECTURE='{ext_arch}' does not match host '{host_arch}'"
         ));
     }
-    if m.sysext_level.is_none() {
-        let v_ok = host
-            .version_id
-            .as_ref()
-            .map(|h| m.version_id.as_deref() == Some(h))
-            .unwrap_or(true);
-        if !v_ok {
+
+    let id = match m.id.as_deref() {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            return Some(
+                "extension-release has no ID= (systemd requires ID= or ID=_any)".to_string(),
+            );
+        }
+    };
+
+    // A host-OS-independent extension matches any host and skips version checks.
+    if id == "_any" {
+        return None;
+    }
+
+    if let Some(host_id) = host.id.as_deref() {
+        let id_like_ok = host
+            .id_like
+            .as_deref()
+            .map(|l| l.split_whitespace().any(|t| t == id))
+            .unwrap_or(false);
+        if id != host_id && !id_like_ok {
+            let like = host
+                .id_like
+                .as_deref()
+                .map(|l| format!(" (or ID_LIKE '{l}')"))
+                .unwrap_or_default();
+            return Some(format!("ID='{id}' does not match host '{host_id}'{like}"));
+        }
+    }
+
+    let host_has_version = host.version_id.is_some();
+    let host_has_level = host.sysext_level.is_some();
+
+    // Rolling releases typically set neither VERSION_ID nor SYSEXT_LEVEL.
+    if !host_has_version && !host_has_level {
+        return None;
+    }
+
+    // If both the host and the extension declare an API level, those must
+    // match; otherwise fall back to comparing the OS VERSION_ID.
+    if host_has_level && m.sysext_level.is_some() {
+        if m.sysext_level != host.sysext_level {
             return Some(format!(
-                "VERSION_ID='{}' does not match host '{}' (set SYSEXT_LEVEL to bypass)",
-                m.version_id.as_deref().unwrap_or("(unset)"),
-                host.version_id.as_deref().unwrap_or("(unset)")
+                "SYSEXT_LEVEL='{}' does not match host '{}'",
+                m.sysext_level.as_deref().unwrap_or("(unset)"),
+                host.sysext_level.as_deref().unwrap_or("(unset)")
             ));
+        }
+        return None;
+    }
+
+    if host_has_version {
+        match m.version_id.as_deref() {
+            Some(v) if Some(v) == host.version_id.as_deref() => {}
+            Some(v) => {
+                return Some(format!(
+                    "VERSION_ID='{v}' does not match host '{}' (set SYSEXT_LEVEL to bypass)",
+                    host.version_id.as_deref().unwrap_or("(unset)")
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "extension-release has no VERSION_ID= but host requires '{}'",
+                    host.version_id.as_deref().unwrap_or("(unset)")
+                ));
+            }
         }
     }
     None
@@ -815,4 +960,149 @@ fn merged_names() -> Result<Vec<String>, String> {
 
 fn merged(name: &str) -> Result<bool, String> {
     Ok(merged_names()?.iter().any(|n| n == name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(id: Option<&str>, version: Option<&str>, level: Option<&str>) -> Manifest {
+        Manifest {
+            name: "ext".to_string(),
+            id: id.map(str::to_string),
+            version_id: version.map(str::to_string),
+            sysext_level: level.map(str::to_string),
+            architecture: None,
+        }
+    }
+
+    fn host(
+        id: &str,
+        id_like: Option<&str>,
+        version: Option<&str>,
+        level: Option<&str>,
+    ) -> osrelease::OsRelease {
+        osrelease::OsRelease {
+            id: Some(id.to_string()),
+            id_like: id_like.map(str::to_string),
+            version_id: version.map(str::to_string),
+            sysext_level: level.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn exact_id_and_version_match() {
+        let m = manifest(Some("fedora"), Some("44"), None);
+        let h = host("fedora", None, Some("44"), None);
+        assert_eq!(metadata_problem(&m, &h), None);
+    }
+
+    #[test]
+    fn version_mismatch_is_reported() {
+        let m = manifest(Some("fedora"), Some("99"), None);
+        let h = host("fedora", None, Some("44"), None);
+        let p = metadata_problem(&m, &h).unwrap();
+        assert!(p.contains("VERSION_ID='99'"), "{p}");
+    }
+
+    #[test]
+    fn id_like_is_accepted() {
+        let m = manifest(Some("rhel"), Some("44"), None);
+        let h = host("fedora", Some("rhel centos"), Some("44"), None);
+        assert_eq!(metadata_problem(&m, &h), None);
+    }
+
+    #[test]
+    fn id_any_bypasses_version_checks() {
+        let m = manifest(Some("_any"), Some("99"), None);
+        let h = host("fedora", None, Some("44"), None);
+        assert_eq!(metadata_problem(&m, &h), None);
+    }
+
+    #[test]
+    fn missing_id_is_rejected() {
+        let m = manifest(None, Some("44"), None);
+        let h = host("fedora", None, Some("44"), None);
+        assert!(metadata_problem(&m, &h).is_some());
+    }
+
+    #[test]
+    fn sysext_level_mismatch_is_reported() {
+        let m = manifest(Some("fedora"), None, Some("999"));
+        let h = host("fedora", None, Some("44"), Some("1"));
+        let p = metadata_problem(&m, &h).unwrap();
+        assert!(p.contains("SYSEXT_LEVEL"), "{p}");
+    }
+
+    #[test]
+    fn sysext_level_match_is_accepted() {
+        let m = manifest(Some("fedora"), Some("99"), Some("1"));
+        let h = host("fedora", None, Some("44"), Some("1"));
+        assert_eq!(metadata_problem(&m, &h), None);
+    }
+
+    #[test]
+    fn extension_level_without_host_level_falls_back_to_version() {
+        // Host has no SYSEXT_LEVEL, so systemd compares VERSION_ID even when
+        // the extension declares SYSEXT_LEVEL.
+        let m = manifest(Some("fedora"), Some("99"), Some("1"));
+        let h = host("fedora", None, Some("44"), None);
+        assert!(metadata_problem(&m, &h).is_some());
+    }
+
+    #[test]
+    fn rolling_host_accepts_any_version() {
+        let m = manifest(Some("fedora"), None, None);
+        let h = host("fedora", None, None, None);
+        assert_eq!(metadata_problem(&m, &h), None);
+    }
+
+    #[test]
+    fn dissect_info_tolerates_missing_sysext_release() {
+        let json = r#"{"useSystemExtension":false}"#;
+        let info: DissectInfo = serde_json::from_str(json).unwrap();
+        assert!(!info.use_system_extension);
+        assert!(info.sysext_release.is_empty());
+    }
+
+    #[test]
+    fn image_name_strips_raw_suffix() {
+        assert_eq!(image_name(Path::new("/tmp/foo.raw")).unwrap(), "foo");
+        assert!(image_name(Path::new("/tmp/foo.txt")).is_err());
+        assert!(image_name(Path::new("/tmp/.raw")).is_err());
+    }
+
+    #[test]
+    fn architecture_any_is_accepted() {
+        let mut m = manifest(Some("fedora"), Some("44"), None);
+        m.architecture = Some("_any".to_string());
+        let h = host("fedora", None, Some("44"), None);
+        assert_eq!(metadata_problem(&m, &h), None);
+    }
+
+    #[test]
+    fn architecture_mismatch_is_reported() {
+        // Pick an architecture that can't match our real host: if the host
+        // reports x86-64, claim arm64, and vice versa.
+        let fake = if host_architecture().as_deref() == Some("arm64") {
+            "x86-64"
+        } else {
+            "arm64"
+        };
+        let mut m = manifest(Some("fedora"), Some("44"), None);
+        m.architecture = Some(fake.to_string());
+        let h = host("fedora", None, Some("44"), None);
+        let p = metadata_problem(&m, &h).unwrap();
+        assert!(p.contains("ARCHITECTURE="), "{p}");
+    }
+
+    #[test]
+    fn architecture_mapping_matches_systemd_strings() {
+        assert_eq!(machine_to_systemd_arch("x86_64"), Some("x86-64"));
+        assert_eq!(machine_to_systemd_arch("aarch64"), Some("arm64"));
+        assert_eq!(machine_to_systemd_arch("armv7l"), Some("arm"));
+        assert_eq!(machine_to_systemd_arch("ppc64le"), Some("ppc64-le"));
+        assert_eq!(machine_to_systemd_arch("s390x"), Some("s390x"));
+        assert_eq!(machine_to_systemd_arch("made-up"), None);
+    }
 }
